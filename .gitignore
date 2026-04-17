@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+
+# cookies et cache stockés dans ~/ donc pas dans le repo,
+# mais au cas où quelqu'un les mettrait ici
+*.json
+!requirements.txt

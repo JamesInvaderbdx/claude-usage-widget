@@ -1,0 +1,4 @@
+customtkinter
+curl_cffi
+pystray
+Pillow
