@@ -5,8 +5,8 @@ import json
 import os
 from datetime import datetime
 
-CACHE_FILE  = os.path.expanduser("~/.claude_widget_cache.json")
-COOKIE_FILE = os.path.expanduser("~/.claude_widget_cookie.json")
+CACHE_FILE  = os.path.expanduser("~/.claudus_cache.json")
+COOKIE_FILE = os.path.expanduser("~/.claudus_cookie.json")
 REFRESH_INTERVAL = 900  # 15 min
 
 # ── cookie storage ────────────────────────────────────────────────────────────
@@ -172,7 +172,7 @@ class SetupDialog:
         self.session_key   = ""
         self.cf_clearance  = ""
         self.root = tk.Tk()
-        self.root.title("Claude Widget – Setup")
+        self.root.title("Claud'Us – Setup")
         self.root.configure(bg="#0a0a14")
         self.root.resizable(False, False)
         self._build()
