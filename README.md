@@ -162,6 +162,12 @@ pythonw widget.py
 
 ---
 
+## Code source
+
+→ [github.com/JamesInvaderbdx/Claud-Us](https://github.com/JamesInvaderbdx/Claud-Us)
+
+---
+
 ## Licence
 
 Projet open source — usage libre.  
