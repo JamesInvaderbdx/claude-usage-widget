@@ -3,7 +3,6 @@ import customtkinter as ctk
 import threading
 import json
 import os
-import re
 from datetime import datetime
 
 CACHE_FILE  = os.path.expanduser("~/.claude_widget_cache.json")
@@ -44,6 +43,30 @@ def load_cache():
     except Exception:
         return None
 
+def _fmt_reset(iso):
+    """ISO timestamp → 'jj/mm HH:MM' en heure locale."""
+    try:
+        dt = datetime.fromisoformat(iso).astimezone(tz=None)
+        return dt.strftime("%d/%m %H:%M")
+    except Exception:
+        return iso[:16]
+
+def _countdown(iso):
+    """ISO timestamp → 'dans Xh Ym' ou 'expiré'."""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso).astimezone(tz=None)
+        diff = dt - datetime.now().astimezone()
+        secs = diff.total_seconds()
+        if secs <= 0:
+            return "expiré"
+        total_min = int(secs // 60)
+        h, m = divmod(total_min, 60)
+        return f"dans {h}h{m:02d}m" if h else f"dans {m}m"
+    except Exception:
+        return ""
+
 # ── scraper ───────────────────────────────────────────────────────────────────
 
 def fetch_usage(session_key, cf_clearance):
@@ -53,8 +76,13 @@ def fetch_usage(session_key, cf_clearance):
     s.cookies.set("sessionKey",   session_key,  domain="claude.ai")
     s.cookies.set("cf_clearance", cf_clearance, domain="claude.ai")
 
-    result = {"plan": "—", "five_hour_pct": None, "seven_day_pct": None,
-              "reset_5h": "—", "reset_7d": "—"}
+    result = {
+        "plan": "—",
+        "five_hour_pct": None, "reset_5h": "—", "reset_5h_iso": "",
+        "seven_day_pct": None, "reset_7d": "—", "reset_7d_iso": "",
+        "add_on_pct":    None, "reset_add_on": "—", "reset_add_on_iso": "",
+        "add_on_used": None, "add_on_limit": None, "add_on_currency": "",
+    }
 
     # 1. account → plan + org uuid
     org_uuid = None
@@ -62,7 +90,6 @@ def fetch_usage(session_key, cf_clearance):
         r = s.get("https://claude.ai/api/account", timeout=15)
         r.raise_for_status()
         acc = r.json()
-        org_uuid = None
         memberships = acc.get("memberships", [])
         if memberships:
             org = memberships[0].get("organization", {})
@@ -93,28 +120,42 @@ def fetch_usage(session_key, cf_clearance):
             result["seven_day_pct"] = sd.get("utilization")
 
             if fh.get("resets_at"):
-                result["reset_5h"] = _fmt_reset(fh["resets_at"])
+                result["reset_5h"]     = _fmt_reset(fh["resets_at"])
+                result["reset_5h_iso"] = fh["resets_at"]
             if sd.get("resets_at"):
-                result["reset_7d"] = _fmt_reset(sd["resets_at"])
+                result["reset_7d"]     = _fmt_reset(sd["resets_at"])
+                result["reset_7d_iso"] = sd["resets_at"]
+
+            # extra_usage (crédits supplémentaires en €)
+            eu = data.get("extra_usage")
+            if eu and eu.get("is_enabled"):
+                result["add_on_pct"]      = eu.get("utilization")
+                result["add_on_used"]     = eu.get("used_credits")
+                result["add_on_limit"]    = eu.get("monthly_limit")
+                result["add_on_currency"] = eu.get("currency", "")
+                result["add_on_renewable"] = eu.get("resets_at") is not None
+                if eu.get("resets_at"):
+                    result["reset_add_on"]     = _fmt_reset(eu["resets_at"])
+                    result["reset_add_on_iso"] = eu["resets_at"]
+
+                # compteur de recharges : détecte si used_credits a baissé
+                prev = load_cache()
+                prev_used  = (prev or {}).get("add_on_used", 0) or 0
+                prev_month = (prev or {}).get("add_on_recharge_month", "")
+                cur_month  = datetime.now().strftime("%Y-%m")
+                prev_count = (prev or {}).get("add_on_recharge_count", 0) if prev_month == cur_month else 0
+                cur_used   = eu.get("used_credits") or 0
+                if prev_month == cur_month and cur_used < prev_used - 1:
+                    prev_count += 1
+                result["add_on_recharge_count"] = prev_count
+                result["add_on_recharge_month"] = cur_month
+
         except Exception as e:
             result["error"] = str(e)
 
     result["updated"] = datetime.now().strftime("%d/%m %H:%M")
     save_cache(result)
     return result
-
-
-def _fmt_reset(iso):
-    """ISO timestamp → 'jj/mm HH:MM' en heure locale."""
-    try:
-        # Python 3.11+ fromisoformat handles timezone offset
-        from datetime import timezone
-        dt = datetime.fromisoformat(iso)
-        # convert to local time
-        local = dt.astimezone(tz=None)
-        return local.strftime("%d/%m %H:%M")
-    except Exception:
-        return iso[:16]
 
 # ── setup dialog ──────────────────────────────────────────────────────────────
 
@@ -177,6 +218,7 @@ class ClaudeWidget:
     ACCENT = "#5555ff"
     GREEN  = "#44ff88"
     CYAN   = "#44ccff"
+    ORANGE = "#ffaa44"
     DIM    = "#444466"
     WHITE  = "#ccccee"
     F      = ("Courier New", 10)
@@ -187,6 +229,9 @@ class ClaudeWidget:
         self.session_key  = session_key
         self.cf_clearance = cf_clearance
         self._tray = None
+        self._iso_5h     = ""
+        self._iso_7d     = ""
+        self._iso_add_on = ""
         ctk.set_appearance_mode("dark")
         self.root = ctk.CTk()
         self.root.title("")
@@ -201,6 +246,7 @@ class ClaudeWidget:
         self._position_bottom_right()
         self._start_tray()
         self._refresh_async()
+        self._tick()
 
     def _position_bottom_right(self):
         self.root.update_idletasks()
@@ -208,9 +254,8 @@ class ClaudeWidget:
         sh = self.root.winfo_screenheight()
         w  = self.root.winfo_width()
         h  = self.root.winfo_height()
-        margin = 12
-        x = sw - w - margin
-        y = sh - h - margin - 48  # 48 = hauteur barre des tâches
+        x = sw - w - 200
+        y = sh - h - 220
         self.root.geometry(f"+{x}+{y}")
 
     def _start_drag(self, e): self._dx, self._dy = e.x, e.y
@@ -248,18 +293,29 @@ class ClaudeWidget:
         body = tk.Frame(inner, bg=self.BG, padx=12, pady=8)
         body.pack(fill="both", expand=True)
         self._bind_drag(inner, body)
+        self._body = body
 
         self.lbl_plan    = tk.Label(body, text="PLAN     : —",               bg=self.BG, fg=self.WHITE, font=self.F,   anchor="w")
         self.lbl_5h      = tk.Label(body, text="5H       : ░░░░░░░░░░  —%", bg=self.BG, fg=self.GREEN, font=self.F,   anchor="w")
         self.lbl_rst_5h  = tk.Label(body, text="  reset  : —",              bg=self.BG, fg=self.DIM,   font=self.FSM, anchor="w")
         self.lbl_7d      = tk.Label(body, text="7 JOURS  : ░░░░░░░░░░  —%", bg=self.BG, fg=self.CYAN,  font=self.F,   anchor="w")
         self.lbl_rst_7d  = tk.Label(body, text="  reset  : —",              bg=self.BG, fg=self.DIM,   font=self.FSM, anchor="w")
+        self.lbl_add_on     = tk.Label(body, text="ADD-ON   : ░░░░░░░░░░  —%", bg=self.BG, fg=self.ORANGE, font=self.F,   anchor="w")
+        self.lbl_rst_add_on = tk.Label(body, text="  reset  : —",              bg=self.BG, fg=self.DIM,    font=self.FSM, anchor="w")
         self.lbl_updated = tk.Label(body, text="UPDATED  : —",              bg=self.BG, fg=self.DIM,   font=self.FSM, anchor="w")
+
         for w in (self.lbl_plan, self.lbl_5h, self.lbl_rst_5h,
-                  self.lbl_7d, self.lbl_rst_7d, self.lbl_updated):
+                  self.lbl_7d, self.lbl_rst_7d,
+                  self.lbl_add_on, self.lbl_rst_add_on):
             w.pack(fill="x", pady=1)
 
+        # add-on masqué par défaut
+        self.lbl_add_on.pack_forget()
+        self.lbl_rst_add_on.pack_forget()
+
         tk.Frame(body, bg=self.BORDER, height=1).pack(fill="x", pady=(6, 4))
+
+        self.lbl_updated.pack(fill="x", pady=(0, 4))
 
         row = tk.Frame(body, bg=self.BG); row.pack(fill="x")
         self.btn_refresh = tk.Button(row, text="⟳ REFRESH", bg=self.BG2,
@@ -271,20 +327,81 @@ class ClaudeWidget:
         self.lbl_status = tk.Label(row, text="", bg=self.BG, fg=self.DIM, font=self.FSM)
         self.lbl_status.pack(side="right")
 
+    def _reset_label(self, iso, fmt_date):
+        """Compose 'dd/mm HH:MM · dans Xh Ym'."""
+        cd = _countdown(iso)
+        return f"  reset  : {fmt_date}  {cd}" if cd else f"  reset  : {fmt_date}"
+
+    def _set_add_on_visible(self, visible):
+        self.lbl_add_on.pack_forget()
+        self.lbl_rst_add_on.pack_forget()
+        if visible:
+            self.lbl_add_on.pack(fill="x", pady=1, after=self.lbl_rst_7d)
+            self.lbl_rst_add_on.pack(fill="x", pady=1, after=self.lbl_add_on)
+
+    def _tick(self):
+        """Met à jour les comptes à rebours toutes les 30s sans appel réseau."""
+        if self._iso_5h:
+            cd = _countdown(self._iso_5h)
+            t  = _fmt_reset(self._iso_5h)
+            self.lbl_rst_5h.config(text=f"  reset  : {t}  {cd}" if cd else f"  reset  : {t}")
+        if self._iso_7d:
+            cd = _countdown(self._iso_7d)
+            t  = _fmt_reset(self._iso_7d)
+            self.lbl_rst_7d.config(text=f"  reset  : {t}  {cd}" if cd else f"  reset  : {t}")
+        if self._iso_add_on:
+            cd = _countdown(self._iso_add_on)
+            t  = _fmt_reset(self._iso_add_on)
+            self.lbl_rst_add_on.config(text=f"  reset  : {t}  {cd}" if cd else f"  reset  : {t}")
+        self.root.after(30_000, self._tick)
+
     def _apply(self, data):
         self.lbl_plan.config(text=f"PLAN     : {data.get('plan','—').upper()}")
 
         fh = data.get("five_hour_pct")
         self.lbl_5h.config(
-            text=f"5H       : {bar(fh)}  {fh:.0f}%" if fh is not None
-            else "5H       : —")
-        self.lbl_rst_5h.config(text=f"  reset  : {data.get('reset_5h','—')}")
+            text=f"5H       : {bar(fh)}  {fh:.0f}%" if fh is not None else "5H       : —")
+        self._iso_5h = data.get("reset_5h_iso", "")
+        self.lbl_rst_5h.config(text=self._reset_label(self._iso_5h, data.get("reset_5h", "—")))
 
         sd = data.get("seven_day_pct")
         self.lbl_7d.config(
-            text=f"7 JOURS  : {bar(sd)}  {sd:.0f}%" if sd is not None
-            else "7 JOURS  : —")
-        self.lbl_rst_7d.config(text=f"  reset  : {data.get('reset_7d','—')}")
+            text=f"7 JOURS  : {bar(sd)}  {sd:.0f}%" if sd is not None else "7 JOURS  : —")
+        self._iso_7d = data.get("reset_7d_iso", "")
+        self.lbl_rst_7d.config(text=self._reset_label(self._iso_7d, data.get("reset_7d", "—")))
+
+        ao = data.get("add_on_pct")
+        if ao is not None:
+            used  = data.get("add_on_used")
+            limit = data.get("add_on_limit")
+            cur   = data.get("add_on_currency", "")
+            if used is not None and limit:
+                used_e  = used  / 200
+                limit_e = limit / 200
+                detail = f"  {used_e:.2f}/{limit_e:.0f}{cur}"
+            else:
+                detail = f"  {ao:.0f}%"
+            self.lbl_add_on.config(text=f"EXTRA    : {bar(ao)}{detail}")
+            self._iso_add_on = data.get("reset_add_on_iso", "")
+            rst_txt = self._reset_label(self._iso_add_on, data.get("reset_add_on", "—"))
+            renewable = data.get("add_on_renewable", False)
+            count     = data.get("add_on_recharge_count", 0)
+            limit_e   = (data.get("add_on_limit") or 0) / 200
+            cur       = data.get("add_on_currency", "")
+            if renewable:
+                cd  = _countdown(self._iso_add_on) if self._iso_add_on else ""
+                txt = f"  auto-recharge {limit_e:.0f}{cur}"
+                if count:
+                    txt += f" · {count}× ce mois"
+                if cd:
+                    txt += f" · cap dans {cd}"
+                self.lbl_rst_add_on.config(text=txt)
+            else:
+                self.lbl_rst_add_on.config(text="  non renouvelable")
+            self._set_add_on_visible(True)
+        else:
+            self._iso_add_on = ""
+            self._set_add_on_visible(False)
 
         self.lbl_updated.config(text=f"UPDATED  : {data.get('updated','—')}")
         self.lbl_status.config(text="ok", fg=self.GREEN)
@@ -330,7 +447,6 @@ class ClaudeWidget:
         import pystray
         from PIL import Image, ImageDraw
 
-        # Petite icône pixel art violet 32×32
         img = Image.new("RGBA", (32, 32), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         d.rectangle([4, 4, 27, 27], fill="#0a0a14", outline="#5555ff", width=2)
